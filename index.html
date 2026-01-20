@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Baseball Score Input</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide@0.263.1/dist/umd/lucide.min.js"></script>
+    <style>
+        body { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        html, body { overscroll-behavior-y: none; }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+    <div id="root"></div>
+
+    <!-- GASから渡された変数を埋め込む隠し要素 -->
+    <div id="gas-config" data-app-url="<?= appUrl ?>" style="display:none;"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- Icon Wrapper ---
+        const IconWrapper = ({ name, size = 24, color = "currentColor", className, ...props }) => {
+            if (typeof lucide === 'undefined' || !lucide.icons) return null;
+            const iconData = lucide.icons[name];
+            if (!iconData) return null;
+            const [tag, attrs, children] = iconData;
+            return React.createElement(tag, { ...attrs, width: size, height: size, stroke: color, className, ...props }, 
+                children.map(([childTag, childAttrs], index) => React.createElement(childTag, { ...childAttrs, key: index }))
+            );
+        };
+        const Icons = new Proxy({}, {
+            get: (target, name) => (props) => <IconWrapper name={name} {...props} />
+        });
+
+        // ==========================================
+        // Constants
+        // ==========================================
+        const BATTING_RESULTS = ['ヒット', '2ベース', '3ベース', '本塁打', '四球', '死球', '三振', 'ゴロアウト', 'フライアウト', 'ライナー', '併殺', '三重殺', '犠打', '犠飛', '失策', '野選', '振逃'];
+        const SPECIAL_RESULTS = ['盗塁', '盗塁死', '暴投', '牽制死', '守備妨害', 'ボーク', 'その他進塁'];
+        const DIRECTION_REQUIRED = ['ヒット', '2ベース', '3ベース', '本塁打', 'ゴロアウト', 'フライアウト', 'ライナー', '併殺', '三重殺', '犠打', '犠飛', '失策', '野選'];
+        const LONG_HIT = ['2ベース', '3ベース', '本塁打'];
+        const RESULT_ABBR = {'ヒット': '安', '2ベース': '2', '3ベース': '3', '本塁打': '本', '四球': '四球', '死球': '死球', '三振': '三振', 'ゴロアウト': 'ゴ', 'フライアウト': '飛', 'ライナー': '直', '併殺': '併', '三重殺': '三併', '犠打': '犠', '犠飛': '犠飛', '失策': '失', '野選': '野', '振逃': '振逃', '盗塁': '盗塁', '盗塁死': '盗死', '暴投': '暴投', '牽制死': '牽制', '守備妨害': '守妨', 'ボーク': 'ボーク', 'その他進塁': '進塁'};
+        
+        // アウトカウント判定用（略称も追加して判定精度を向上）
+        const OUT_COUNTS = {
+            'ゴロアウト': 1, 'フライアウト': 1, 'ライナー': 1, '三振': 1, '犠打': 1, '犠飛': 1, '併殺': 2, '三重殺': 3, '盗塁死': 1, '牽制死': 1, '守備妨害': 1,
+            'ゴ': 1, '飛': 1, '直': 1, '振': 1, '犠': 1, '併': 2, '三併': 3, '盗死': 1
+        };
+
+        // ==========================================
+        // Main Application
+        // ==========================================
+        const App = () => {
+            // Auto-detect GAS App URL from hidden div
+            const configEl = document.getElementById('gas-config');
+            const detectedGasUrl = configEl ? configEl.getAttribute('data-app-url') : '';
+
+            // --- State ---
+            const [gameInfo, setGameInfo] = useState({ date: new Date().toISOString().split('T')[0], opponent: '', topOrBottom: 'bottom' });
+            const [maxOrder, setMaxOrder] = useState(9);
+            const initialLineup = { 1: '', 2: '', 3: '', 4: '', 5: '', 6: '', 7: '', 8: '', 9: '', 10: '' };
+            const [lineup, setLineup] = useState(initialLineup);
+            const [roster, setRoster] = useState([]);
+            
+            // Play State
+            const initialPlayState = { inning: '1', outs: '0', runners: '0', pitcherHand: '右', battingOrder: '1', batter: '', result: '', rbi: '0', runsScored: '0', note: '' };
+            const [playData, setPlayData] = useState(initialPlayState);
+            const [entries, setEntries] = useState(() => { const saved = localStorage.getItem('baseballEntriesV3'); return saved ? JSON.parse(saved) : []; });
+            
+            // UI State
+            const [showLineupModal, setShowLineupModal] = useState(false);
+            const [showSettings, setShowSettings] = useState(false);
+            const [showChangeModal, setShowChangeModal] = useState(false);
+            const [showScoreboard, setShowScoreboard] = useState(false); 
+            const [waitingForDirection, setWaitingForDirection] = useState(false);
+            const [tempResult, setTempResult] = useState(null);
+            const [editingId, setEditingId] = useState(null);
+            const [isAdvance, setIsAdvance] = useState(false);
+            
+            // System State
+            const [status, setStatus] = useState({ type: 'idle', message: '' });
+            const [gasUrl, setGasUrl] = useState(detectedGasUrl);
+            const [spreadsheetUrl, setSpreadsheetUrl] = useState('');
+            const [isOnline, setIsOnline] = useState(navigator.onLine);
+            const [newPlayerName, setNewPlayerName] = useState("");
+            const [selectedRosterPlayer, setSelectedRosterPlayer] = useState(null);
+            const [myTeamName, setMyTeamName] = useState("自チーム");
+
+            // Options
+            const inningOptions = Array.from({ length: 15 }, (_, i) => i + 1); 
+            const orderOptions = Array.from({ length: maxOrder }, (_, i) => i + 1);
+
+            // --- Effects ---
+            useEffect(() => {
+                const handleOnline = () => setIsOnline(true);
+                const handleOffline = () => setIsOnline(false);
+                window.addEventListener('online', handleOnline);
+                window.addEventListener('offline', handleOffline);
+                
+                // Load LocalStorage
+                const savedSsUrl = localStorage.getItem('baseballSpreadsheetUrl');
+                if (savedSsUrl) setSpreadsheetUrl(savedSsUrl);
+                
+                const savedMyTeam = localStorage.getItem('baseballMyTeamName');
+                if (savedMyTeam) setMyTeamName(savedMyTeam);
+
+                const savedGameInfo = localStorage.getItem('baseballGameInfo');
+                if (savedGameInfo) setGameInfo(prev => ({ ...prev, ...JSON.parse(savedGameInfo) })); 
+                
+                const savedLineup = localStorage.getItem('baseballLineup');
+                if (savedLineup) {
+                    const parsedLineup = JSON.parse(savedLineup);
+                    setLineup(parsedLineup);
+                    if (!playData.batter && parsedLineup[1]) setPlayData(prev => ({ ...prev, batter: parsedLineup[1] }));
+                }
+                const savedRoster = localStorage.getItem('baseballRoster');
+                if (savedRoster) setRoster(JSON.parse(savedRoster));
+                const savedMaxOrder = localStorage.getItem('baseballMaxOrder');
+                if (savedMaxOrder) setMaxOrder(parseInt(savedMaxOrder));
+
+                // Auto fetch if we have both URLs
+                if (gasUrl && savedSsUrl && navigator.onLine && (!savedRoster || JSON.parse(savedRoster).length === 0)) {
+                    fetchRosterFromGAS(savedSsUrl);
+                }
+
+                // If Spreadsheet URL is missing, force settings
+                if (!savedSsUrl) {
+                    setTimeout(() => setShowSettings(true), 500);
+                }
+
+                return () => {
+                    window.removeEventListener('online', handleOnline);
+                    window.removeEventListener('offline', handleOffline);
+                };
+            }, []);
+
+            useEffect(() => { localStorage.setItem('baseballEntriesV3', JSON.stringify(entries)); }, [entries]);
+            useEffect(() => { localStorage.setItem('baseballGameInfo', JSON.stringify(gameInfo)); }, [gameInfo]);
+            useEffect(() => { localStorage.setItem('baseballLineup', JSON.stringify(lineup)); }, [lineup]);
+            useEffect(() => { localStorage.setItem('baseballRoster', JSON.stringify(roster)); }, [roster]);
+            useEffect(() => { localStorage.setItem('baseballMaxOrder', maxOrder.toString()); }, [maxOrder]);
+            useEffect(() => { localStorage.setItem('baseballMyTeamName', myTeamName); }, [myTeamName]);
+
+            // --- Handlers ---
+            const handleSpreadsheetUrlChange = (e) => { 
+                const url = e.target.value.trim(); 
+                setSpreadsheetUrl(url); 
+                localStorage.setItem('baseballSpreadsheetUrl', url); 
+            };
+            const handleGameInfoChange = (e) => { setGameInfo(prev => ({ ...prev, [e.target.name]: e.target.value })); };
+            const handleMyTeamNameChange = (e) => { setMyTeamName(e.target.value); };
+            
+            const handleLineupChange = (order, name) => {
+                setLineup(prev => ({ ...prev, [order]: name }));
+                if (!editingId && String(order) === String(playData.battingOrder) && !SPECIAL_RESULTS.includes(playData.result)) {
+                    setPlayData(prev => ({ ...prev, batter: name }));
+                }
+            };
+
+            // GAS Interaction
+            const fetchRosterFromGAS = async (ssUrl) => {
+                const targetSsUrl = ssUrl || spreadsheetUrl;
+                if (!targetSsUrl) { alert("設定画面でスプレッドシートのURLを入力してください"); return; }
+
+                try {
+                    setStatus({ type: 'loading', message: 'リスト更新中...' });
+                    const query = `?type=roster&spreadsheetUrl=${encodeURIComponent(targetSsUrl)}`;
+                    const res = await fetch(`${gasUrl}${query}`);
+                    
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (Array.isArray(data)) {
+                            setRoster(prev => Array.from(new Set([...prev, ...data])));
+                            setStatus({ type: 'success', message: 'リスト更新完了' });
+                            setTimeout(() => setStatus({ type: 'idle', message: '' }), 2000);
+                        } else if (data.error) {
+                            alert("アクセスエラー: 他チームのシートの場合、右上の共有ボタンから開発者(あなた)のアドレスを招待してください。\n\n詳細: " + data.error);
+                            setStatus({ type: 'error', message: '権限エラー' });
+                        }
+                    } else {
+                        setStatus({ type: 'error', message: '通信失敗' });
+                    }
+                } catch (e) {
+                    console.error("Failed", e);
+                    setStatus({ type: 'error', message: '通信エラー' });
+                }
+            };
+
+            const addPlayerToRoster = async (e) => {
+                e.preventDefault();
+                const name = newPlayerName.trim();
+                if (!name) return;
+                if (roster.includes(name)) { alert("登録済みです"); return; }
+                if (!spreadsheetUrl) { alert("設定でスプレッドシートのURLを入力してください"); setShowSettings(true); return; }
+                
+                if (gasUrl && isOnline) {
+                    try {
+                        setStatus({ type: 'loading', message: '登録中...' });
+                        await fetch(gasUrl, {
+                            method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: 'register_player', name: name, spreadsheetUrl: spreadsheetUrl })
+                        });
+                        setStatus({ type: 'success', message: `登録完了: ${name}` });
+                        setTimeout(() => setStatus({ type: 'idle', message: '' }), 3000);
+                    } catch (err) { alert("GASへの登録失敗"); }
+                }
+                setRoster([...roster, name]);
+                setNewPlayerName("");
+            };
+
+            const renamePlayer = async (oldName) => {
+                const newName = prompt(`${oldName} の新しい名前`, oldName);
+                if (!newName || newName === oldName) return;
+                if (roster.includes(newName)) { alert("その名前は既に使用されています"); return; }
+                if (!spreadsheetUrl) { alert("設定でスプレッドシートのURLを入力してください"); setShowSettings(true); return; }
+
+                setRoster(roster.map(n => n === oldName ? newName : n));
+                setLineup(prev => {
+                    const next = { ...prev };
+                    Object.keys(next).forEach(k => { if (next[k] === oldName) next[k] = newName; });
+                    return next;
+                });
+                if (playData.batter === oldName) setPlayData(prev => ({ ...prev, batter: newName }));
+
+                if (gasUrl && isOnline) {
+                    try {
+                        setStatus({ type: 'loading', message: 'リネーム中...' });
+                        await fetch(gasUrl, {
+                            method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: 'rename_player', oldName: oldName, newName: newName, spreadsheetUrl: spreadsheetUrl })
+                        });
+                        setStatus({ type: 'success', message: `変更完了` });
+                        setTimeout(() => setStatus({ type: 'idle', message: '' }), 3000);
+                    } catch (err) { alert("GASへの反映失敗"); }
+                }
+            };
+
+            const removePlayerFromRoster = (name) => { if (confirm(`${name} をリストから削除しますか？`)) setRoster(roster.filter(p => p !== name)); };
+            const handleRosterClick = (player) => { setSelectedRosterPlayer(selectedRosterPlayer === player ? null : player); };
+            const handleOrderSlotClick = (orderNum) => { if (selectedRosterPlayer) handleLineupChange(orderNum, selectedRosterPlayer); };
+
+            // Play Input Logic
+            const handlePlayChange = (e) => {
+                const { name, value } = e.target;
+                if (name === 'battingOrder') setPlayData(prev => ({ ...prev, [name]: value, batter: lineup[value] || '' }));
+                else setPlayData(prev => ({ ...prev, [name]: value }));
+            };
+            const handleResultClick = (res) => {
+                if (DIRECTION_REQUIRED.includes(res)) { 
+                    setTempResult(res); 
+                    setWaitingForDirection(true); 
+                    
+                    // 【修正】犠飛の場合は打点1, 得点1を自動セット
+                    if (res === '犠飛') {
+                         setPlayData(prev => ({ ...prev, result: res, rbi: '1', runsScored: '1' }));
+                    } else {
+                         setPlayData(prev => ({ ...prev, result: res })); 
+                    }
+                }
+                else {
+                    const isSpecial = SPECIAL_RESULTS.includes(res);
+                    setPlayData(prev => ({ ...prev, result: res, batter: isSpecial ? '' : (editingId ? prev.batter : (lineup[prev.battingOrder] || '')) }));
+                    setWaitingForDirection(false); setTempResult(null);
+                }
+            };
+            const handleDirectionSelect = (pos) => {
+                if (!tempResult) return;
+                
+                // 【修正】犠飛の場合は接尾辞を '飛' にする
+                let suffix = RESULT_ABBR[tempResult];
+                if (tempResult === '犠飛') {
+                    suffix = '飛';
+                }
+
+                let resultStr = pos + suffix;
+                if (isAdvance && tempResult === 'ゴロアウト') resultStr += "進";
+                setPlayData(prev => ({ ...prev, result: resultStr }));
+                setWaitingForDirection(false); setTempResult(null);
+            };
+            const handleDirectionCancel = () => { setWaitingForDirection(false); setTempResult(null); setPlayData(prev => ({ ...prev, result: 'ヒット' })); };
+            const handleRunnerSelect = (e) => setPlayData(prev => ({ ...prev, batter: e.target.value }));
+            const getBases = (rStr) => ({ first: ['1', '12', '13', '123'].includes(rStr), second: ['2', '12', '23', '123'].includes(rStr), third: ['3', '13', '23', '123'].includes(rStr) });
+            const toggleBase = (base) => {
+                const current = getBases(playData.runners); const next = { ...current, [base]: !current[base] };
+                let nextVal = '0';
+                if (next.first && next.second && next.third) nextVal = '123'; else if (next.first && next.second) nextVal = '12'; else if (next.first && next.third) nextVal = '13'; else if (next.second && next.third) nextVal = '23'; else if (next.first) nextVal = '1'; else if (next.second) nextVal = '2'; else if (next.third) nextVal = '3';
+                setPlayData(prev => ({ ...prev, runners: nextVal }));
+            };
+            const togglePitcherHand = () => setPlayData(prev => ({ ...prev, pitcherHand: prev.pitcherHand === '右' ? '左' : '右' }));
+            const toggleOuts = () => { const current = parseInt(playData.outs); setPlayData(prev => ({ ...prev, outs: ((current + 1) % 3).toString() })); };
+            
+            // Edit & Submit Logic
+            const handleEditStart = (entry) => { setPlayData({ ...entry }); setEditingId(entry.id); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+            const handleEditCancel = () => { setEditingId(null); setPlayData(prev => ({ ...initialPlayState, inning: prev.inning, outs: prev.outs, runners: prev.runners, pitcherHand: prev.pitcherHand })); setWaitingForDirection(false); };
+            const handleChangeInning = () => { const nextInning = String(parseInt(playData.inning) + 1); setPlayData(prev => ({ ...prev, outs: '0', runners: '0', inning: nextInning })); setShowChangeModal(false); };
+            
+            const updateInningScores = (currentEntries, targetInning) => {
+                const targetEntries = currentEntries.filter(e => String(e.inning) === String(targetInning));
+                const sortedTargetEntries = [...targetEntries].sort((a, b) => a.id - b.id);
+                let runningTotal = 0; 
+                const scoreMap = {};
+                sortedTargetEntries.forEach(entry => { const runs = parseInt(entry.runsScored) || 0; runningTotal += runs; scoreMap[entry.id] = runningTotal; });
+                return currentEntries.map(entry => { if (String(entry.inning) === String(targetInning)) { return { ...entry, inningTotalScore: scoreMap[entry.id].toString() }; } return entry; });
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (waitingForDirection) { alert("打球方向を選択してください"); return; }
+                const isSpecial = SPECIAL_RESULTS.some(r => playData.result.includes(r));
+                const isSteal = playData.result.includes('盗塁');
+                if (!playData.batter) { if (isSteal) { alert("盗塁者を選択"); return; } if (!isSpecial && !confirm("打者名が空ですが記録しますか？")) return; }
+                
+                let addedOuts = 0;
+                Object.keys(OUT_COUNTS).forEach(key => { if (playData.result.includes(key)) addedOuts = OUT_COUNTS[key]; });
+                let nextOuts = parseInt(playData.outs) + addedOuts;
+                if (nextOuts > 3) nextOuts = 3;
+
+                const entryToSave = { 
+                    ...gameInfo, ...playData, 
+                    outs: nextOuts.toString(), 
+                    inningTotalScore: '0', 
+                    id: editingId || Date.now(), 
+                    timestamp: editingId ? undefined : new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) 
+                };
+
+                let updatedEntries = [];
+                if (editingId) {
+                    const tempEntries = entries.map(entry => entry.id === editingId ? { ...entry, ...entryToSave, timestamp: entry.timestamp } : entry);
+                    updatedEntries = updateInningScores(tempEntries, playData.inning);
+                    setEditingId(null); alert("更新しました");
+                    setPlayData(prev => ({ ...initialPlayState, inning: prev.inning, outs: prev.outs, runners: prev.runners, pitcherHand: prev.pitcherHand }));
+                } else {
+                    updatedEntries = updateInningScores([...entries, entryToSave], playData.inning);
+                    if (nextOuts >= 3) { 
+                        setPlayData(prev => ({ ...prev, outs: '3' })); 
+                        setShowChangeModal(true); 
+                    } else {
+                        if (isSpecial) { 
+                            setPlayData(prev => ({ ...prev, outs: nextOuts.toString(), batter: lineup[prev.battingOrder] || '', result: 'ヒット', rbi: '0', runsScored: '0', note: '' })); 
+                        } else { 
+                            const nextOrder = (parseInt(playData.battingOrder) % maxOrder) + 1; 
+                            setPlayData(prev => ({ ...prev, outs: nextOuts.toString(), battingOrder: nextOrder.toString(), batter: lineup[nextOrder] || '', result: 'ヒット', rbi: '0', runsScored: '0', note: '' })); 
+                        }
+                    }
+                }
+                setEntries(updatedEntries); setIsAdvance(false);
+            };
+
+            const handleDelete = (id) => { const target = entries.find(e => e.id === id); if(!target) return; setEntries(updateInningScores(entries.filter(e => e.id !== id), target.inning)); };
+            const handleClearAll = () => { if (confirm('全消去しますか？')) setEntries([]); };
+            const clearLineup = () => { if(confirm('リセットしますか？')) setLineup(initialLineup); };
+            const formatDate = (d) => d.replace(/-/g, '/');
+            const getResultColor = (result) => {
+                if (result.includes('本')) return 'bg-pink-50 border-pink-200 text-pink-700'; if (result.includes('安') || result.includes('2') || result.includes('3')) return 'bg-orange-50 border-orange-200 text-orange-700'; if (result.includes('四') || result.includes('死')) return 'bg-green-50 border-green-200 text-green-700'; if (result.includes('ゴ') || result.includes('飛') || result.includes('直') || result.includes('振') || result.includes('併')) return 'bg-gray-50 border-gray-200 text-gray-500'; if (result.includes('盗')) return 'bg-purple-50 border-purple-200 text-purple-700'; if (result.includes('暴') || result.includes('逸')) return 'bg-yellow-50 border-yellow-200 text-yellow-700'; return 'bg-blue-50 border-blue-200 text-blue-700';
+            };
+
+            // Scoreboard Modal Component
+            const ScoreboardModal = ({ entries, onClose, onSend, myTeamName, opponentName }) => {
+                const [myScores, setMyScores] = useState({});
+                const [oppScores, setOppScores] = useState({});
+                const [isTop, setIsTop] = useState(gameInfo.topOrBottom === 'top');
+                const [inningsCount, setInningsCount] = useState(9); // デフォルト9回
+
+                useEffect(() => {
+                    // 自チームスコアの自動集計
+                    const calc = {};
+                    entries.forEach(e => {
+                        const inn = parseInt(e.inning);
+                        const runs = parseInt(e.runsScored) || 0;
+                        if (!calc[inn]) calc[inn] = 0;
+                        calc[inn] += runs;
+                    });
+                    setMyScores(prev => {
+                        const next = { ...prev };
+                        Object.keys(calc).forEach(k => next[k] = calc[k]);
+                        return next;
+                    });
+                }, [entries]);
+
+                // 合計計算（xは0点扱い）
+                const calculateTotal = (scores) => {
+                    let total = 0;
+                    Object.values(scores).forEach(val => {
+                        if (val === 'x' || val === 'X') return;
+                        total += parseInt(val || 0);
+                    });
+                    return total;
+                };
+
+                const myTotal = calculateTotal(myScores);
+                const oppTotal = calculateTotal(oppScores);
+
+                const handleMyScoreChange = (inn, val) => {
+                    setMyScores(prev => ({ ...prev, [inn]: val }));
+                };
+
+                const handleOppScoreChange = (inn, val) => {
+                    setOppScores(prev => ({ ...prev, [inn]: val }));
+                };
+
+                const toggleOrder = () => {
+                    const nextIsTop = !isTop;
+                    setIsTop(nextIsTop);
+                    setGameInfo(prev => ({ ...prev, topOrBottom: nextIsTop ? 'top' : 'bottom' }));
+                };
+
+                const topTeam = isTop ? { name: myTeamName, scores: myScores, total: myTotal, isMe: true } : { name: opponentName || '相手', scores: oppScores, total: oppTotal, isMe: false };
+                const bottomTeam = isTop ? { name: opponentName || '相手', scores: oppScores, total: oppTotal, isMe: false } : { name: myTeamName, scores: myScores, total: myTotal, isMe: true };
+
+                const renderRow = (team) => (
+                    <tr>
+                        <td className={`p-2 border border-gray-200 font-bold text-sm text-left truncate max-w-[100px] ${team.isMe ? 'text-blue-800 bg-blue-50/50' : ''}`}>{team.name}</td>
+                        {Array.from({ length: inningsCount }, (_, i) => i + 1).map(i => (
+                            <td key={i} className="p-0 border border-gray-200 w-9">
+                                <input 
+                                    type="text" 
+                                    value={team.scores[i] === undefined ? '' : team.scores[i]} 
+                                    placeholder="0"
+                                    onChange={(e) => team.isMe ? handleMyScoreChange(i, e.target.value) : handleOppScoreChange(i, e.target.value)}
+                                    className={`w-full h-full text-center p-1 font-bold text-lg outline-none focus:bg-yellow-50 ${team.isMe ? 'text-blue-900' : 'text-gray-700'}`}
+                                />
+                            </td>
+                        ))}
+                        <td className="p-2 border border-gray-200 font-black text-xl bg-gray-50">{team.total}</td>
+                    </tr>
+                );
+
+                return (
+                    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+                        <div className="bg-white w-full max-w-4xl rounded-xl shadow-2xl overflow-hidden animate-in zoom-in-95 flex flex-col max-h-[90vh]">
+                            <div className="bg-blue-900 text-white p-4 flex justify-between items-center shrink-0">
+                                <h3 className="font-bold text-lg flex items-center gap-2"><Icons.Trophy size={20}/> 得点盤入力</h3>
+                                <button onClick={onClose}><Icons.X size={20}/></button>
+                            </div>
+                            <div className="p-4 overflow-y-auto">
+                                <div className="flex flex-col md:flex-row justify-between items-center mb-4 gap-3">
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs font-bold text-gray-500">イニング数:</span>
+                                        <div className="flex items-center border rounded bg-white">
+                                            <button onClick={() => setInningsCount(Math.max(1, inningsCount - 1))} className="px-3 py-1 hover:bg-gray-100 text-gray-600 font-bold">-</button>
+                                            <span className="px-3 font-bold text-blue-900">{inningsCount}</span>
+                                            <button onClick={() => setInningsCount(inningsCount + 1)} className="px-3 py-1 hover:bg-gray-100 text-gray-600 font-bold">+</button>
+                                        </div>
+                                    </div>
+                                    <button onClick={toggleOrder} className="text-xs bg-gray-200 hover:bg-gray-300 px-3 py-1.5 rounded-full font-bold flex items-center gap-1 transition">
+                                        <Icons.ArrowUpDown size={14}/>
+                                        {isTop ? '自チームが先攻' : '自チームが後攻'}
+                                    </button>
+                                </div>
+                                
+                                <p className="text-[10px] text-gray-400 mb-2 text-right">※「x」を入力すると得点なし扱いで合計されます</p>
+                                <div className="overflow-x-auto mb-6 border rounded-lg shadow-sm">
+                                    <table className="w-full text-center border-collapse">
+                                        <thead>
+                                            <tr className="bg-gray-800 text-white text-xs">
+                                                <th className="p-2 border border-gray-700 whitespace-nowrap sticky left-0 z-10 bg-gray-800">TEAM</th>
+                                                {Array.from({ length: inningsCount }, (_, i) => i + 1).map(i => <th key={i} className="p-2 border border-gray-700 min-w-[2.5rem]"> {i} </th>)}
+                                                <th className="p-2 border border-gray-700 bg-gray-900 w-12 sticky right-0 z-10">R</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {renderRow(topTeam)}
+                                            {renderRow(bottomTeam)}
+                                        </tbody>
+                                    </table>
+                                </div>
+
+                                <div className="flex gap-3">
+                                    <button onClick={onClose} className="flex-1 py-3 border border-gray-300 rounded-lg font-bold text-gray-600">閉じる</button>
+                                    <button onClick={() => onSend(myScores, oppScores, inningsCount)} className="flex-1 py-3 bg-indigo-600 text-white rounded-lg font-bold shadow-lg hover:bg-indigo-700 flex items-center justify-center gap-2">
+                                        <Icons.Send size={18} /> データ送信
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            const handleSendAll = async (myScores, oppScores, inningsCount) => {
+                if (!spreadsheetUrl || !isOnline) { 
+                    alert("設定画面でスプレッドシートURLを入力してください"); 
+                    setShowSettings(true);
+                    return; 
+                }
+                if (!confirm("送信後は修正できません。間違いはありませんか？")) return;
+                
+                setStatus({ type: 'loading', message: `送信中...` });
+                try {
+                    const playLogs = [...entries].reverse().map(e => ({
+                        row: [ null, null, formatDate(e.date), e.opponent, e.pitcherHand, e.battingOrder, e.inning, e.outs, e.runners, e.batter, e.result, null, e.rbi, e.inningTotalScore || '0' ]
+                    }));
+
+                    // 合計計算
+                    const calculateTotal = (scores) => {
+                        let total = 0;
+                        Object.values(scores).forEach(val => {
+                            if (val === 'x' || val === 'X') return;
+                            total += parseInt(val || 0);
+                        });
+                        return total;
+                    };
+                    
+                    const myTotal = calculateTotal(myScores);
+                    const oppTotal = calculateTotal(oppScores);
+                    
+                    const isTop = gameInfo.topOrBottom === 'top';
+                    const opponentName = gameInfo.opponent || '相手';
+
+                    // 先攻・後攻のデータを作成 (isMeフラグを追加)
+                    const topData = isTop ? { ...myScores, total: myTotal, name: myTeamName, isMe: true } : { ...oppScores, total: oppTotal, name: opponentName, isMe: false };
+                    const bottomData = isTop ? { ...oppScores, total: oppTotal, name: opponentName, isMe: false } : { ...myScores, total: myTotal, name: myTeamName, isMe: true };
+
+                    const scoreBoard = {
+                        top: topData,
+                        bottom: bottomData
+                    };
+
+                    const dataToSend = {
+                        action: 'save_game_data',
+                        gameInfo: gameInfo,
+                        playLogs: playLogs,
+                        scoreBoard: scoreBoard,
+                        inningsCount: inningsCount, 
+                        spreadsheetUrl: spreadsheetUrl
+                    };
+
+                    await fetch(gasUrl, { 
+                        method: 'POST', 
+                        mode: 'no-cors', 
+                        headers: { 'Content-Type': 'application/json' }, 
+                        body: JSON.stringify(dataToSend) 
+                    });
+
+                    setStatus({ type: 'success', message: '送信完了！' });
+                    setEntries([]); 
+                    setShowScoreboard(false);
+                    setTimeout(() => setStatus({ type: 'idle', message: '' }), 4000);
+                } catch (error) { 
+                    setStatus({ type: 'error', message: '送信エラー: ' + error.toString() }); 
+                }
+            };
+
+            // ==========================================
+            // Render
+            // ==========================================
+            return (
+                <div className="min-h-screen bg-slate-100 font-sans pb-20 md:pb-10 relative animate-in fade-in">
+                    
+                    {/* Header */}
+                    <header className="bg-blue-900 text-white p-3 shadow-md sticky top-0 z-40">
+                        <div className="flex justify-between items-center max-w-5xl mx-auto">
+                            <h1 className="font-bold text-lg flex items-center gap-2"><Icons.Activity size={20}/> スコア入力</h1>
+                            <div className="flex items-center gap-2">
+                                <button onClick={() => setShowScoreboard(true)} className="flex items-center gap-2 bg-blue-800 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-bold transition border border-blue-600 shadow-md">
+                                    <Icons.Table size={18} /> 得点盤
+                                </button>
+                                <button onClick={() => setShowSettings(true)} className="p-2 hover:bg-white/10 rounded-full transition"><Icons.Settings size={20}/></button>
+                            </div>
+                        </div>
+                    </header>
+
+                    <div className="max-w-5xl mx-auto p-2 md:p-6">
+                        {/* Game Info Input */}
+                        <div className="bg-white p-4 rounded-xl shadow-sm mb-4 border border-slate-200">
+                             <div className="flex flex-col md:flex-row gap-3 md:items-end">
+                                <div className="flex gap-3 w-full md:flex-1">
+                                    <div className="w-1/3 md:w-40">
+                                        <label className="block text-[10px] font-bold text-gray-400">試合日</label>
+                                        <input type="date" name="date" value={gameInfo.date} onChange={handleGameInfoChange} className="w-full text-xs p-2 border rounded" />
+                                    </div>
+                                    <div className="flex-1">
+                                        <label className="block text-[10px] font-bold text-gray-400">相手</label>
+                                        <input type="text" name="opponent" placeholder="チーム名" value={gameInfo.opponent} onChange={handleGameInfoChange} className="w-full text-xs p-2 border rounded" />
+                                    </div>
+                                </div>
+                                <div className="flex gap-2 w-full md:w-auto justify-end mt-1 md:mt-0">
+                                    <button onClick={() => setShowSettings(true)} className="flex-1 md:flex-none justify-center flex items-center gap-1 bg-slate-100 text-slate-600 border border-slate-300 px-3 py-2 rounded text-xs font-bold hover:bg-slate-200 transition">
+                                        <Icons.Settings size={16} /> 設定
+                                    </button>
+                                    <button onClick={() => setShowLineupModal(true)} className="flex-1 md:flex-none justify-center flex items-center gap-1 bg-indigo-50 text-indigo-700 border border-indigo-200 px-3 py-2 rounded text-xs font-bold hover:bg-indigo-100 transition">
+                                        <Icons.ListOrdered size={16} /> オーダー
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="grid md:grid-cols-12 gap-4">
+                            {/* Input Column */}
+                            <section className="md:col-span-5 flex flex-col gap-3">
+                                <div className={`bg-white p-4 rounded-xl shadow-sm border-t-4 ${editingId ? 'border-orange-500' : 'border-blue-600'}`}>
+                                    <div className="flex justify-between items-center mb-3"><h2 className={`text-sm font-bold flex items-center gap-2 ${editingId ? 'text-orange-600' : 'text-gray-500'}`}>{editingId ? "修正モード" : "打席入力"}</h2>{editingId && <button onClick={handleEditCancel} className="text-xs text-gray-500 underline">キャンセル</button>}</div>
+                                    <form onSubmit={handleSubmit} className="space-y-4">
+                                        {/* Diamond Field (Same as before) */}
+                                        <div className={`relative w-full aspect-[4/3] bg-emerald-600 rounded-xl overflow-hidden shadow-inner border-2 select-none transition-all ${waitingForDirection ? 'border-blue-500 ring-4 ring-blue-200' : 'border-emerald-700'}`}>
+                                            <div className="absolute inset-0 opacity-10 pointer-events-none" style={{ backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 10px, #000 10px, #000 20px)' }}></div>
+                                            {waitingForDirection && (
+                                                <div className="absolute inset-0 z-30 bg-black/10 animate-pulse">
+                                                    <div className="absolute top-2 w-full text-center"><span className="bg-blue-600 text-white px-3 py-1 rounded-full text-xs font-bold shadow animate-bounce">打球方向を選択してください</span></div>
+                                                </div>
+                                            )}
+                                            <div className="absolute top-2 left-2 z-20"><div className="bg-gray-900/90 border border-gray-600 rounded-lg p-2 shadow-xl flex flex-col gap-2"><div className="flex items-center justify-between gap-2"><span className="text-[10px] text-gray-400 font-bold tracking-widest">INN</span><div className="relative bg-black rounded border border-gray-700 w-12 h-8 flex items-center justify-center overflow-hidden"><select name="inning" value={playData.inning} onChange={handlePlayChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10">{inningOptions.map(inn => <option key={inn} value={inn}>{inn}</option>)}</select><span className="text-yellow-400 font-mono text-xl font-bold">{playData.inning}</span></div></div><div className="flex items-center justify-between gap-2"><span className="text-[10px] text-gray-400 font-bold tracking-widest">OUT</span><button type="button" onClick={toggleOuts} className="bg-black rounded border border-gray-700 px-2 h-8 flex items-center gap-1.5 cursor-pointer w-12 justify-center"><div className={`w-2.5 h-2.5 rounded-full ${parseInt(playData.outs) >= 1 ? 'bg-red-500' : 'bg-gray-800'}`}></div><div className={`w-2.5 h-2.5 rounded-full ${parseInt(playData.outs) >= 2 ? 'bg-red-500' : 'bg-gray-800'}`}></div></button></div></div></div>
+                                            <div className="absolute top-2 right-2 z-20"><button type="button" onClick={handleChangeInning} className="bg-white/90 hover:bg-white text-gray-800 text-xs font-bold py-2 px-3 rounded-lg border-2 border-gray-300 shadow-lg flex flex-col items-center gap-0.5 active:scale-95 transition"><Icons.RefreshCw size={16} className="text-blue-600" />CHANGE</button></div>
+                                            <svg viewBox="0 0 400 300" className="absolute inset-0 w-full h-full pointer-events-none"><path d="M -50 150 Q 200 -50 450 150" stroke="white" strokeWidth="2" fill="none" opacity="0.3" /><path d="M 200 240 Q 50 150 200 40 Q 350 150 200 240" fill="#8b4513" opacity="0.4" /><path d="M 200 240 L 300 140 L 200 40 L 100 140 Z" stroke="white" strokeWidth="3" fill="none" /></svg>
+                                            
+                                            <button type="button" onClick={() => toggleBase('second')} className={`absolute top-[13.3%] left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 transform rotate-45 border-2 shadow-lg flex items-center justify-center transition-all z-10 ${getBases(playData.runners).second ? 'bg-red-500 border-white scale-110' : 'bg-white border-gray-300'}`}>{getBases(playData.runners).second && <span className="transform -rotate-45 text-white font-black text-sm">2B</span>}</button>
+                                            <button type="button" onClick={() => toggleBase('third')} className={`absolute top-[46.6%] left-[25%] -translate-x-1/2 -translate-y-1/2 w-12 h-12 transform rotate-45 border-2 shadow-lg flex items-center justify-center transition-all z-10 ${getBases(playData.runners).third ? 'bg-red-500 border-white scale-110' : 'bg-white border-gray-300'}`}>{getBases(playData.runners).third && <span className="transform -rotate-45 text-white font-black text-sm">3B</span>}</button>
+                                            <button type="button" onClick={() => toggleBase('first')} className={`absolute top-[46.6%] left-[75%] -translate-x-1/2 -translate-y-1/2 w-12 h-12 transform rotate-45 border-2 shadow-lg flex items-center justify-center transition-all z-10 ${getBases(playData.runners).first ? 'bg-red-500 border-white scale-110' : 'bg-white border-gray-300'}`}>{getBases(playData.runners).first && <span className="transform -rotate-45 text-white font-black text-sm">1B</span>}</button>
+                                            <div className="absolute top-[46.6%] left-1/2 -translate-x-1/2 -translate-y-1/2 z-10"><button type="button" onClick={togglePitcherHand} className="w-16 h-16 bg-[#d2b48c] border-2 border-white rounded-full shadow-lg flex flex-col items-center justify-center hover:scale-105 transition"><span className="text-[9px] font-bold text-emerald-900 uppercase">Pitcher</span><span className="text-xl font-black text-emerald-900 leading-none">{playData.pitcherHand}</span></button></div>
+                                            
+                                            <div className="absolute bottom-2 left-1/2 -translate-x-1/2 w-[94%] z-20"><div className={`bg-white/95 backdrop-blur-sm p-2 rounded-lg shadow-xl border-2 ${editingId ? 'border-orange-400 bg-orange-50' : 'border-gray-200'}`}>{editingId && <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-orange-500 text-white text-[10px] px-2 py-0.5 rounded-full shadow font-bold">編集中</div>}{playData.result.includes('盗塁') ? (<div className="relative animate-in slide-in-from-bottom-2"><label className="text-[10px] font-bold text-purple-700 block mb-1">誰が盗塁？</label><select value={playData.batter} onChange={handleRunnerSelect} className="w-full p-2 text-md border rounded bg-purple-50 font-bold text-gray-800 outline-none"><option value="">選択してください</option>{orderOptions.map(o => <option key={o} value={lineup[o] || ''}>{o}番: {lineup[o] || '(未登録)'}</option>)}<option value="代走">代走</option></select></div>) : (<div className="flex gap-2"><div className="w-16 flex-shrink-0"><label className="block text-[9px] text-gray-500 font-bold mb-0.5 text-center">ORDER</label><select name="battingOrder" value={playData.battingOrder} onChange={handlePlayChange} className="w-full p-1.5 text-center font-bold border-2 border-gray-200 rounded bg-gray-50 text-xl outline-none">{orderOptions.map(o => <option key={o} value={o}>{o}</option>)}</select></div><div className="flex-1"><label className="block text-[9px] text-gray-500 font-bold mb-0.5">BATTER</label><input type="text" name="batter" placeholder="名前" value={playData.batter} onChange={handlePlayChange} autoComplete="off" className="w-full p-1.5 text-lg font-bold border-2 border-gray-200 rounded bg-white text-gray-900 outline-none" /></div></div>)}</div></div>
+                                        </div>
+
+                                        {/* Result Buttons */}
+                                        <div>
+                                            <div className="flex justify-between items-center mb-1"><label className="text-[10px] text-gray-500">結果</label><label className="flex items-center gap-1 bg-blue-50 px-2 rounded cursor-pointer"><input type="checkbox" checked={isAdvance} onChange={(e) => setIsAdvance(e.target.checked)} className="text-blue-600" /><span className="text-xs text-blue-700 font-bold">進塁打</span></label></div>
+                                            {playData.result && (<div className="mb-2 p-2 bg-blue-50 border border-blue-200 rounded-lg text-center animate-in fade-in slide-in-from-top-1"><span className="text-xs text-blue-600 font-bold mr-2">現在の入力:</span><span className="text-lg font-black text-blue-800">{playData.result}</span></div>)}
+                                            <div className="grid grid-cols-4 gap-2 mb-3">{BATTING_RESULTS.map(res => (<button type="button" key={res} onClick={() => handleResultClick(res)} className={`p-2 text-xs font-bold rounded border transition ${playData.result.includes(RESULT_ABBR[res]) ? 'bg-blue-600 text-white' : 'bg-white hover:bg-blue-50'}`}>{res}</button>))}</div>
+                                            <div className="text-center text-[10px] text-gray-400 mb-1">- その他 -</div>
+                                            <div className="grid grid-cols-3 gap-2">{SPECIAL_RESULTS.map(res => (<button type="button" key={res} onClick={() => handleResultClick(res)} className={`p-2 text-xs font-bold rounded border transition ${playData.result === res ? 'bg-purple-600 text-white' : 'bg-slate-50 hover:bg-purple-50'}`}>{res}</button>))}</div>
+                                        </div>
+                                        
+                                        {/* Score Inputs */}
+                                        <div className="grid grid-cols-2 gap-3 bg-orange-50 p-2 rounded border border-orange-100">
+                                            <div><label className="block text-[10px] text-center text-gray-500">打点</label><div className="flex gap-1">{['0','1','2','3','4'].map(r=><button type="button" key={r} onClick={()=>setPlayData(prev=>({...prev, rbi:r}))} className={`flex-1 text-xs font-bold rounded ${playData.rbi===r?'bg-orange-500 text-white':'bg-white'}`}>{r}</button>)}</div></div>
+                                            <div><label className="block text-[10px] text-center text-gray-500">得点</label><div className="flex gap-1">{['0','1','2','3','4'].map(r=><button type="button" key={r} onClick={()=>setPlayData(prev=>({...prev, runsScored:r}))} className={`flex-1 text-xs font-bold rounded ${playData.runsScored===r?'bg-orange-500 text-white':'bg-white'}`}>{r}</button>)}</div></div>
+                                        </div>
+                                        <button type="submit" className={`w-full font-bold py-4 rounded-xl shadow-lg text-white ${editingId ? 'bg-orange-500' : 'bg-blue-600'} disabled:bg-gray-400`}>{editingId ? "更新する" : "記録して次へ"}</button>
+                                    </form>
+                                </div>
+                            </section>
+
+                            {/* List Column */}
+                            <section className="md:col-span-7 flex flex-col h-full gap-3">
+                                <div className="bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col flex-1 min-h-[400px]">
+                                    <div className="p-3 border-b flex justify-between items-center bg-gray-50 rounded-t-xl"><h2 className="font-bold text-gray-700 text-sm flex items-center gap-2"><Icons.ClipboardList size={16}/> 記録リスト ({entries.length})</h2>{entries.length > 0 && <button onClick={handleClearAll} className="text-xs text-red-500">全消去</button>}</div>
+                                    <div className="flex-1 overflow-y-auto p-2 bg-slate-50/30">
+                                        <ul className="space-y-2">
+                                            {entries.slice().reverse().map((entry) => (
+                                                <li key={entry.id} className={`border p-2 rounded-lg shadow-sm flex gap-3 items-center bg-white ${getResultColor(entry.result)}`}>
+                                                    <div className="flex flex-col items-center min-w-[3rem] border-r pr-2"><span className="text-lg font-bold">{entry.inning}<span className="text-[10px]">回</span></span><span className="text-[10px] text-gray-400">{entry.battingOrder}番</span></div>
+                                                    <div className="flex-1"><div className="flex items-center gap-2 mb-1"><span className="text-xs font-bold">{entry.batter}</span><span className="text-[10px] bg-gray-100 text-gray-500 px-1 rounded">P:{entry.pitcherHand}</span><div className="flex gap-1 ml-auto"><span className="text-[10px] bg-blue-100 text-blue-700 px-1 rounded font-bold">計{entry.inningTotalScore}</span></div></div><div className="flex justify-between items-end"><span className="text-sm font-bold">{entry.result}</span><span className="text-[10px] text-gray-400">{entry.outs}アウト / 走:{entry.runners}</span></div></div>
+                                                    <div className="flex flex-col gap-1"><button onClick={() => handleEditStart(entry)} className="text-gray-400 hover:text-blue-600"><Icons.Edit2 size={16}/></button><button onClick={() => handleDelete(entry.id)} className="text-gray-300 hover:text-red-500"><Icons.Trash2 size={16}/></button></div>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                    <div className="p-4 bg-white border-t border-gray-100 rounded-b-xl space-y-2">
+                                        {status.message && <div className={`text-center text-xs font-bold ${status.type==='error'?'text-red-600':'text-green-600'}`}>{status.message}</div>}
+                                        <button onClick={() => setShowScoreboard(true)} disabled={entries.length === 0} className="w-full py-4 bg-blue-900 hover:bg-blue-800 text-white font-bold rounded-lg shadow-lg transition flex justify-center items-center gap-2 disabled:bg-gray-300 disabled:shadow-none">
+                                            <Icons.Trophy size={20}/> 試合終了 / スコアボード送信
+                                        </button>
+                                    </div>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+
+                    {/* --- Modals --- */}
+                    
+                    {/* Lineup Modal */}
+                    {showLineupModal && (
+                        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+                            <div className="bg-white w-full max-w-4xl h-[90vh] rounded-xl shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in-95">
+                                <div className="p-4 bg-blue-600 text-white flex justify-between items-center shrink-0"><h3 className="font-bold flex items-center gap-2"><Icons.ListOrdered size={20} /> スタメン & 選手リスト</h3><button onClick={() => setShowLineupModal(false)} className="hover:bg-blue-500 p-1 rounded-full"><Icons.X size={20} /></button></div>
+                                <div className="flex-1 overflow-hidden flex flex-col md:flex-row">
+                                    <div className="flex-1 p-4 overflow-y-auto border-r bg-slate-50">
+                                        <div className="flex justify-between mb-3"><h4 className="font-bold text-gray-700">オーダー表</h4><div className="bg-white border rounded p-0.5 flex gap-1"><button onClick={() => setMaxOrder(9)} className={`px-2 text-xs font-bold ${maxOrder === 9 ? 'bg-blue-100 text-blue-700' : ''}`}>9</button><button onClick={() => setMaxOrder(10)} className={`px-2 text-xs font-bold ${maxOrder === 10 ? 'bg-blue-100 text-blue-700' : ''}`}>10</button></div></div>
+                                        <div className="space-y-2">{orderOptions.map(n => (<div key={n} onClick={() => handleOrderSlotClick(n)} className={`flex items-center gap-2 p-1 rounded cursor-pointer transition ${selectedRosterPlayer && !lineup[n] ? 'bg-blue-50 ring-2 ring-blue-300' : ''}`}><span className="w-8 h-8 flex shrink-0 items-center justify-center bg-blue-100 text-blue-700 font-bold rounded-full text-sm">{n}</span><div className="flex-1 relative"><input type="text" value={lineup[n]} onChange={(e) => handleLineupChange(n, e.target.value)} className={`w-full p-2 border rounded pointer-events-none ${lineup[n] ? 'bg-white font-bold' : 'bg-gray-100'}`} />{lineup[n] && <button onClick={(e) => { e.stopPropagation(); handleLineupChange(n, ''); }} className="absolute right-2 top-2 text-gray-400 pointer-events-auto"><Icons.X size={14} /></button>}</div></div>))}</div>
+                                    </div>
+                                    <div className="w-full md:w-72 bg-white flex flex-col">
+                                        <div className="p-3 bg-gray-50 border-b">
+                                            <form onSubmit={addPlayerToRoster} className="flex gap-2 mb-2"><input type="text" placeholder="選手名追加" value={newPlayerName} onChange={(e) => setNewPlayerName(e.target.value)} className="flex-1 p-2 border rounded" /><button type="submit" className="bg-blue-600 text-white p-2 rounded"><Icons.PlusCircle size={16}/></button></form>
+                                            <button onClick={() => fetchRosterFromGAS(spreadsheetUrl)} className="w-full py-2.5 bg-green-600 text-white text-xs font-bold rounded shadow hover:bg-green-700 flex items-center justify-center gap-2 mb-2 transition"><Icons.DownloadCloud size={16}/> 選手リストをGASから読み込む</button>
+                                            <p className="text-[10px] text-gray-400 text-center">リストから選手をタップ→オーダー表をタップで配置</p>
+                                        </div>
+                                        <div className="flex-1 p-3 overflow-y-auto"><div className="flex flex-wrap gap-2 content-start">{roster.map((p, i) => (<div key={i} className="relative group"><button onClick={() => handleRosterClick(p)} className={`px-3 py-1.5 rounded-full border text-sm font-bold transition flex items-center gap-1 ${selectedRosterPlayer === p ? 'bg-blue-600 text-white ring-2 ring-blue-300 scale-105' : Object.values(lineup).includes(p) ? 'bg-gray-100 text-gray-400 border-gray-200' : 'bg-white hover:border-blue-400'}`}><Icons.User size={12}/> {p} {Object.values(lineup).includes(p) && <span className="text-[9px] bg-gray-200 px-1 rounded ml-1">済</span>}</button><button onClick={() => removePlayerFromRoster(p)} className="absolute -top-1 -right-1 bg-red-500 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100 transition shadow-sm hover:scale-110"><Icons.X size={10} /></button></div>))}</div></div>
+                                    </div>
+                                </div>
+                                <div className="p-3 border-t bg-gray-50 flex justify-between"><button onClick={clearLineup} className="text-red-500 text-xs">リセット</button><button onClick={() => setShowLineupModal(false)} className="bg-blue-600 text-white px-6 py-2 rounded font-bold">完了</button></div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Settings Modal */}
+                    {showSettings && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                            <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setShowSettings(false)}></div>
+                            <div className="bg-white w-full max-w-md p-6 rounded-xl shadow-2xl relative z-10 animate-in fade-in zoom-in-95 flex flex-col max-h-[80vh]">
+                                <div className="flex justify-between items-center mb-4"><h3 className="font-bold text-lg">設定</h3><button onClick={() => setShowSettings(false)}><Icons.X size={20} /></button></div>
+                                <div className="flex-1 overflow-y-auto">
+                                    <div className="bg-blue-50 p-4 rounded mb-4 border border-blue-100">
+                                        <p className="text-sm font-bold text-blue-800 mb-2 flex items-center gap-1"><Icons.Link size={16}/> スプレッドシート連携</p>
+                                        <p className="text-xs text-blue-600 mb-3">送られてきたスプレッドシートのURLを貼り付けてください。</p>
+                                        
+                                        <div className="mb-2">
+                                            <p className="text-[10px] font-bold text-blue-600 mb-1">対象スプレッドシートURL</p>
+                                            <input type="text" placeholder="https://docs.google.com/spreadsheets/d/..." value={spreadsheetUrl} onChange={handleSpreadsheetUrlChange} className="w-full p-3 border-2 border-blue-200 rounded text-xs break-all shadow-inner focus:border-blue-500 outline-none transition" />
+                                        </div>
+                                    </div>
+                                    <div className="bg-gray-50 p-3 rounded border">
+                                        <h4 className="text-sm font-bold mb-2">選手リスト管理</h4>
+                                        <div className="flex-1 overflow-y-auto max-h-40 border rounded p-2 bg-white mb-2">{roster.map((p, i) => (<div key={i} className="flex justify-between items-center p-2 hover:bg-gray-50 border-b last:border-0"><span className="font-bold text-sm">{p}</span><div className="flex gap-1"><button onClick={() => renamePlayer(p)} className="text-gray-400 hover:text-blue-600 p-1"><Icons.Edit2 size={14}/></button><button onClick={() => removePlayerFromRoster(p)} className="text-gray-400 hover:text-red-600 p-1"><Icons.Trash2 size={14}/></button></div></div>))}</div>
+                                        <button onClick={() => fetchRosterFromGAS(spreadsheetUrl)} className="w-full py-2 bg-white border border-blue-600 text-blue-600 text-sm font-bold rounded hover:bg-blue-50 flex items-center justify-center gap-2"><Icons.DownloadCloud size={16}/> シートからリストを再取得</button>
+                                    </div>
+                                    <div className="mt-6 pt-4 border-t border-gray-100">
+                                        <a href="mailto:allbisons25@gmail.com?subject=スコア入力アプリについて" className="w-full flex items-center justify-center gap-2 text-gray-500 hover:text-blue-600 text-xs font-bold py-2 transition">
+                                            <Icons.Mail size={16} /> 不具合・問い合わせ
+                                        </a>
+                                    </div>
+                                </div>
+                                <div className="text-right mt-4 pt-2 border-t"><button onClick={() => setShowSettings(false)} className="bg-gray-800 text-white px-4 py-2 rounded font-bold">閉じる</button></div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Direction Modal */}
+                    {waitingForDirection && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"><div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={handleDirectionCancel}></div><div className="bg-white w-full max-w-sm rounded-xl shadow-2xl relative z-10 overflow-hidden animate-in zoom-in-95"><div className="bg-blue-600 p-3 text-white flex justify-between items-center"><h3 className="font-bold flex items-center gap-2 text-lg"><Icons.Target size={24}/> {tempResult}の打球方向</h3><button onClick={handleDirectionCancel} className="p-1 hover:bg-blue-500 rounded-full transition"><Icons.X size={24}/></button></div><div className="relative aspect-[4/3] bg-emerald-600 shadow-inner"><div className="absolute inset-0 opacity-10 pointer-events-none" style={{ backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 10px, #000 10px, #000 20px)' }}></div><svg viewBox="0 0 400 300" className="absolute inset-0 w-full h-full pointer-events-none opacity-50"><path d="M -50 150 Q 200 -50 450 150" stroke="white" strokeWidth="2" fill="none" opacity="0.3" /><path d="M 200 240 Q 50 150 200 40 Q 350 150 200 240" fill="#8b4513" opacity="0.4" /><path d="M 200 240 L 300 140 L 200 40 L 100 140 Z" stroke="white" strokeWidth="3" fill="none" /></svg>
+                        
+                        {/* キャンセルボタンをグラウンド右上にも追加 */}
+                        <button onClick={handleDirectionCancel} className="absolute top-2 right-2 bg-white/80 p-1.5 rounded-full text-gray-700 shadow-md hover:bg-white transition z-40">
+                            <Icons.X size={20} />
+                        </button>
+
+                        <button type="button" onClick={() => handleDirectionSelect('投')} className="absolute top-[46%] left-[50%] -translate-x-1/2 -translate-y-1/2 w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">投</button>
+                        <button type="button" onClick={() => handleDirectionSelect('捕')} className="absolute bottom-[15%] left-[50%] -translate-x-1/2 w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">捕</button>
+                        <button type="button" onClick={() => handleDirectionSelect('一')} className="absolute top-[45%] right-[15%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">一</button>
+                        <button type="button" onClick={() => handleDirectionSelect('二')} className="absolute top-[25%] right-[35%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">二</button>
+                        <button type="button" onClick={() => handleDirectionSelect('三')} className="absolute top-[45%] left-[15%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">三</button>
+                        <button type="button" onClick={() => handleDirectionSelect('遊')} className="absolute top-[25%] left-[35%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">遊</button>
+                        <button type="button" onClick={() => handleDirectionSelect('左')} className="absolute top-[10%] left-[15%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">左</button>
+                        <button type="button" onClick={() => handleDirectionSelect('中')} className="absolute top-[5%] left-[50%] -translate-x-1/2 w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">中</button>
+                        <button type="button" onClick={() => handleDirectionSelect('右')} className="absolute top-[10%] right-[15%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-sm hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">右</button>
+                        {LONG_HIT.includes(tempResult) && ( <> 
+                            <button type="button" onClick={() => handleDirectionSelect('左中')} className="absolute top-[5%] left-[30%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-[10px] hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">左中</button> 
+                            <button type="button" onClick={() => handleDirectionSelect('右中')} className="absolute top-[5%] right-[30%] w-10 h-10 bg-white/95 border-2 border-blue-500 rounded-full shadow-lg flex items-center justify-center text-blue-800 font-black text-[10px] hover:bg-blue-500 hover:text-white transition active:scale-95 z-30">右中</button> 
+                        </> )}</div><div className="p-3 text-center text-sm text-gray-500 bg-gray-50">間違えた場合は右上の×ボタンで戻れます</div></div></div>
+                    )}
+
+                    {/* Change Inning Modal */}
+                    {showChangeModal && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4"><div className="absolute inset-0 bg-black/50 backdrop-blur-sm"></div><div className="bg-white w-full max-w-sm p-6 rounded-xl shadow-2xl relative z-10 animate-in zoom-in-95 text-center border-t-8 border-blue-600"><h3 className="text-2xl font-black text-gray-800 mb-2">3 OUT CHANGE!</h3><p className="text-gray-500 mb-6 text-sm">3アウトになりました。</p><button onClick={handleChangeInning} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-xl shadow-md">次イニングへ</button></div></div>
+                    )}
+
+                    {/* Scoreboard Modal */}
+                    {showScoreboard && (
+                        <ScoreboardModal 
+                            entries={entries} 
+                            onClose={() => setShowScoreboard(false)} 
+                            onSend={handleSendAll}
+                            myTeamName={myTeamName}
+                            opponentName={gameInfo.opponent}
+                        />
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
