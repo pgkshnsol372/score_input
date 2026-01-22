@@ -19,9 +19,6 @@
 <body class="bg-slate-100 text-slate-800">
     <div id="root"></div>
 
-    <!-- GASから渡された変数を埋め込む隠し要素 -->
-    <div id="gas-config" data-app-url="<?= appUrl ?>" style="display:none;"></div>
-
     <script type="text/babel">
         const { useState, useEffect, useMemo, useRef } = React;
 
@@ -40,15 +37,20 @@
         });
 
         // ==========================================
-        // Constants
+        // Configuration & Constants
         // ==========================================
+        
+        // ★★★ マニュアルのURLを設定する場合 ★★★
+        // マニュアルもGitHub Pagesで公開した場合は、そのURLをここに入力すると便利です。
+        // 例: "https://your-username.github.io/baseball-score/manual.html"
+        const DEFAULT_MANUAL_URL = ""; 
+
         const BATTING_RESULTS = ['ヒット', '2ベース', '3ベース', '本塁打', '四球', '死球', '三振', 'ゴロアウト', 'フライアウト', 'ライナー', '併殺', '三重殺', '犠打', '犠飛', '失策', '野選', '振逃'];
         const SPECIAL_RESULTS = ['盗塁', '盗塁死', '暴投', '牽制死', '守備妨害', 'ボーク', 'その他進塁'];
         const DIRECTION_REQUIRED = ['ヒット', '2ベース', '3ベース', '本塁打', 'ゴロアウト', 'フライアウト', 'ライナー', '併殺', '三重殺', '犠打', '犠飛', '失策', '野選'];
         const LONG_HIT = ['2ベース', '3ベース', '本塁打'];
         const RESULT_ABBR = {'ヒット': '安', '2ベース': '2', '3ベース': '3', '本塁打': '本', '四球': '四球', '死球': '死球', '三振': '三振', 'ゴロアウト': 'ゴ', 'フライアウト': '飛', 'ライナー': '直', '併殺': '併', '三重殺': '三併', '犠打': '犠', '犠飛': '犠飛', '失策': '失', '野選': '野', '振逃': '振逃', '盗塁': '盗塁', '盗塁死': '盗死', '暴投': '暴投', '牽制死': '牽制', '守備妨害': '守妨', 'ボーク': 'ボーク', 'その他進塁': '進塁'};
         
-        // アウトカウント判定用（略称も追加して判定精度を向上）
         const OUT_COUNTS = {
             'ゴロアウト': 1, 'フライアウト': 1, 'ライナー': 1, '三振': 1, '犠打': 1, '犠飛': 1, '併殺': 2, '三重殺': 3, '盗塁死': 1, '牽制死': 1, '守備妨害': 1,
             'ゴ': 1, '飛': 1, '直': 1, '振': 1, '犠': 1, '併': 2, '三併': 3, '盗死': 1
@@ -58,10 +60,6 @@
         // Main Application
         // ==========================================
         const App = () => {
-            // Auto-detect GAS App URL from hidden div
-            const configEl = document.getElementById('gas-config');
-            const detectedGasUrl = configEl ? configEl.getAttribute('data-app-url') : '';
-
             // --- State ---
             const [gameInfo, setGameInfo] = useState({ date: new Date().toISOString().split('T')[0], opponent: '', topOrBottom: 'bottom' });
             const [maxOrder, setMaxOrder] = useState(9);
@@ -86,8 +84,9 @@
             
             // System State
             const [status, setStatus] = useState({ type: 'idle', message: '' });
-            const [gasUrl, setGasUrl] = useState(detectedGasUrl);
+            const [gasUrl, setGasUrl] = useState('');
             const [spreadsheetUrl, setSpreadsheetUrl] = useState('');
+            const [manualUrl, setManualUrl] = useState('');
             const [isOnline, setIsOnline] = useState(navigator.onLine);
             const [newPlayerName, setNewPlayerName] = useState("");
             const [selectedRosterPlayer, setSelectedRosterPlayer] = useState(null);
@@ -105,9 +104,19 @@
                 window.addEventListener('offline', handleOffline);
                 
                 // Load LocalStorage
+                const savedUrl = localStorage.getItem('baseballGasUrl');
+                if (savedUrl) setGasUrl(savedUrl);
+
                 const savedSsUrl = localStorage.getItem('baseballSpreadsheetUrl');
                 if (savedSsUrl) setSpreadsheetUrl(savedSsUrl);
                 
+                const savedManualUrl = localStorage.getItem('baseballManualUrl');
+                if (savedManualUrl) {
+                    setManualUrl(savedManualUrl);
+                } else if (DEFAULT_MANUAL_URL) {
+                    setManualUrl(DEFAULT_MANUAL_URL);
+                }
+
                 const savedMyTeam = localStorage.getItem('baseballMyTeamName');
                 if (savedMyTeam) setMyTeamName(savedMyTeam);
 
@@ -126,12 +135,12 @@
                 if (savedMaxOrder) setMaxOrder(parseInt(savedMaxOrder));
 
                 // Auto fetch if we have both URLs
-                if (gasUrl && savedSsUrl && navigator.onLine && (!savedRoster || JSON.parse(savedRoster).length === 0)) {
-                    fetchRosterFromGAS(savedSsUrl);
+                if (savedUrl && savedSsUrl && navigator.onLine && (!savedRoster || JSON.parse(savedRoster).length === 0)) {
+                    fetchRosterFromGAS(savedUrl, savedSsUrl);
                 }
 
-                // If Spreadsheet URL is missing, force settings
-                if (!savedSsUrl) {
+                // If URLs are missing, show settings after a short delay
+                if (!savedUrl || !savedSsUrl) {
                     setTimeout(() => setShowSettings(true), 500);
                 }
 
@@ -147,12 +156,23 @@
             useEffect(() => { localStorage.setItem('baseballRoster', JSON.stringify(roster)); }, [roster]);
             useEffect(() => { localStorage.setItem('baseballMaxOrder', maxOrder.toString()); }, [maxOrder]);
             useEffect(() => { localStorage.setItem('baseballMyTeamName', myTeamName); }, [myTeamName]);
+            useEffect(() => { localStorage.setItem('baseballManualUrl', manualUrl); }, [manualUrl]);
 
             // --- Handlers ---
+            const handleUrlChange = (e) => { 
+                const url = e.target.value.trim(); 
+                setGasUrl(url); 
+                localStorage.setItem('baseballGasUrl', url); 
+            };
             const handleSpreadsheetUrlChange = (e) => { 
                 const url = e.target.value.trim(); 
                 setSpreadsheetUrl(url); 
                 localStorage.setItem('baseballSpreadsheetUrl', url); 
+            };
+            const handleManualUrlChange = (e) => {
+                const url = e.target.value.trim();
+                setManualUrl(url);
+                localStorage.setItem('baseballManualUrl', url);
             };
             const handleGameInfoChange = (e) => { setGameInfo(prev => ({ ...prev, [e.target.name]: e.target.value })); };
             const handleMyTeamNameChange = (e) => { setMyTeamName(e.target.value); };
@@ -164,15 +184,36 @@
                 }
             };
 
+            const openManual = () => {
+                if (!manualUrl) {
+                    alert("マニュアルURLが設定されていません。\n設定画面の「操作マニュアルURL」に入力するか、管理者に確認してください。");
+                    setShowSettings(true);
+                    return;
+                }
+                window.open(manualUrl, '_blank');
+            };
+
             // GAS Interaction
-            const fetchRosterFromGAS = async (ssUrl) => {
+            // Note: When calling from GitHub Pages, GAS Web App URL must be set manually by the user
+            const fetchRosterFromGAS = async (url, ssUrl) => {
+                const targetUrl = url || gasUrl;
                 const targetSsUrl = ssUrl || spreadsheetUrl;
-                if (!targetSsUrl) { alert("設定画面でスプレッドシートのURLを入力してください"); return; }
+                
+                if (!targetUrl) { 
+                    // Silent return during initial auto-fetch, alert if manual
+                    if (!url) alert("設定画面でGAS WebアプリのURLを入力してください");
+                    return; 
+                }
+                if (!targetSsUrl) {
+                    if (!ssUrl) alert("設定画面でスプレッドシートのURLを入力してください");
+                    return;
+                }
 
                 try {
                     setStatus({ type: 'loading', message: 'リスト更新中...' });
                     const query = `?type=roster&spreadsheetUrl=${encodeURIComponent(targetSsUrl)}`;
-                    const res = await fetch(`${gasUrl}${query}`);
+                    // GAS doGet returns JSON. This usually works cross-origin with 'redirect: follow'
+                    const res = await fetch(`${targetUrl}${query}`);
                     
                     if (res.ok) {
                         const data = await res.json();
@@ -181,7 +222,7 @@
                             setStatus({ type: 'success', message: 'リスト更新完了' });
                             setTimeout(() => setStatus({ type: 'idle', message: '' }), 2000);
                         } else if (data.error) {
-                            alert("アクセスエラー: 他チームのシートの場合、右上の共有ボタンから開発者(あなた)のアドレスを招待してください。\n\n詳細: " + data.error);
+                            alert("アクセスエラー: " + data.error);
                             setStatus({ type: 'error', message: '権限エラー' });
                         }
                     } else {
@@ -190,6 +231,7 @@
                 } catch (e) {
                     console.error("Failed", e);
                     setStatus({ type: 'error', message: '通信エラー' });
+                    alert("データ取得に失敗しました。\n・GASのURLが正しいか\n・デプロイ設定で「アクセスできるユーザー: 全員」になっているか\n確認してください。");
                 }
             };
 
@@ -257,7 +299,6 @@
                     setTempResult(res); 
                     setWaitingForDirection(true); 
                     
-                    // 【修正】犠飛の場合は打点1, 得点1を自動セット
                     if (res === '犠飛') {
                          setPlayData(prev => ({ ...prev, result: res, rbi: '1', runsScored: '1' }));
                     } else {
@@ -273,7 +314,6 @@
             const handleDirectionSelect = (pos) => {
                 if (!tempResult) return;
                 
-                // 【修正】犠飛の場合は接尾辞を '飛' にする
                 let suffix = RESULT_ABBR[tempResult];
                 if (tempResult === '犠飛') {
                     suffix = '飛';
@@ -485,8 +525,8 @@
             };
 
             const handleSendAll = async (myScores, oppScores, inningsCount) => {
-                if (!spreadsheetUrl || !isOnline) { 
-                    alert("設定画面でスプレッドシートURLを入力してください"); 
+                if (!gasUrl || !spreadsheetUrl || !isOnline) { 
+                    alert("設定画面でGAS URLとスプレッドシートURLを入力してください"); 
                     setShowSettings(true);
                     return; 
                 }
@@ -563,6 +603,9 @@
                                     <Icons.Table size={18} /> 得点盤
                                 </button>
                                 <button onClick={() => setShowSettings(true)} className="p-2 hover:bg-white/10 rounded-full transition"><Icons.Settings size={20}/></button>
+                                <button onClick={openManual} className="flex items-center gap-1 hover:bg-white/10 px-3 py-2 rounded-lg text-xs font-bold transition border border-white/20">
+                                    <Icons.HelpCircle size={16}/> 操作説明
+                                </button>
                             </div>
                         </div>
                     </header>
@@ -697,12 +740,20 @@
                                 <div className="flex justify-between items-center mb-4"><h3 className="font-bold text-lg">設定</h3><button onClick={() => setShowSettings(false)}><Icons.X size={20} /></button></div>
                                 <div className="flex-1 overflow-y-auto">
                                     <div className="bg-blue-50 p-4 rounded mb-4 border border-blue-100">
-                                        <p className="text-sm font-bold text-blue-800 mb-2 flex items-center gap-1"><Icons.Link size={16}/> スプレッドシート連携</p>
-                                        <p className="text-xs text-blue-600 mb-3">送られてきたスプレッドシートのURLを貼り付けてください。</p>
+                                        <p className="text-sm font-bold text-blue-800 mb-2 flex items-center gap-1"><Icons.Link size={16}/> 連携URL設定</p>
                                         
+                                        <div className="mb-3">
+                                            <p className="text-[10px] font-bold text-blue-600 mb-1">① GAS Web App URL (必須)</p>
+                                            <input type="text" placeholder="https://script.google.com/macros/s/..." value={gasUrl} onChange={handleUrlChange} className="w-full p-2 border rounded text-xs break-all shadow-inner" />
+                                            <p className="text-[9px] text-gray-500 mt-1">※このアプリのGASウェブアプリURLを入力</p>
+                                        </div>
+                                        <div className="mb-3">
+                                            <p className="text-[10px] font-bold text-blue-600 mb-1">② 対象スプレッドシートURL (必須)</p>
+                                            <input type="text" placeholder="https://docs.google.com/spreadsheets/d/..." value={spreadsheetUrl} onChange={handleSpreadsheetUrlChange} className="w-full p-2 border rounded text-xs break-all shadow-inner" />
+                                        </div>
                                         <div className="mb-2">
-                                            <p className="text-[10px] font-bold text-blue-600 mb-1">対象スプレッドシートURL</p>
-                                            <input type="text" placeholder="https://docs.google.com/spreadsheets/d/..." value={spreadsheetUrl} onChange={handleSpreadsheetUrlChange} className="w-full p-3 border-2 border-blue-200 rounded text-xs break-all shadow-inner focus:border-blue-500 outline-none transition" />
+                                            <p className="text-[10px] font-bold text-blue-600 mb-1">自チーム名</p>
+                                            <input type="text" placeholder="チーム名" value={myTeamName} onChange={handleMyTeamNameChange} className="w-full p-3 border-2 border-blue-200 rounded text-xs break-all shadow-inner focus:border-blue-500 outline-none transition" />
                                         </div>
                                     </div>
                                     <div className="bg-gray-50 p-3 rounded border">
@@ -711,7 +762,7 @@
                                         <button onClick={() => fetchRosterFromGAS(spreadsheetUrl)} className="w-full py-2 bg-white border border-blue-600 text-blue-600 text-sm font-bold rounded hover:bg-blue-50 flex items-center justify-center gap-2"><Icons.DownloadCloud size={16}/> シートからリストを再取得</button>
                                     </div>
                                     <div className="mt-6 pt-4 border-t border-gray-100">
-                                        <a href="mailto:allbisons25@gmail.com?subject=スコア入力アプリについて" className="w-full flex items-center justify-center gap-2 text-gray-500 hover:text-blue-600 text-xs font-bold py-2 transition">
+                                        <a href="mailto:contact@example.com?subject=スコア入力アプリについて" className="w-full flex items-center justify-center gap-2 text-gray-500 hover:text-blue-600 text-xs font-bold py-2 transition">
                                             <Icons.Mail size={16} /> 不具合・問い合わせ
                                         </a>
                                     </div>
